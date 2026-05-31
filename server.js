@@ -65,13 +65,14 @@ function supabaseGet(path) {
 }
 
 function buildHtml(date, calendarEvents, columns, cards) {
-  const colMap = {};
-  for (const col of columns) colMap[col.id] = col;
+  // column_id in cards stores the column NAME (not numeric id)
+  const colByName = {};
+  for (const col of columns) colByName[col.name] = col;
 
   const boardData = { weekly: {}, weekly_ops: {} };
   for (const card of cards) {
     const board = card.board;
-    const colName = colMap[card.column_id]?.name || 'Sin columna';
+    const colName = card.column_id || 'Sin columna';
     if (!boardData[board][colName]) boardData[board][colName] = [];
     boardData[board][colName].push(card);
   }
@@ -90,8 +91,15 @@ function buildHtml(date, calendarEvents, columns, cards) {
   function buildBoard(boardKey) {
     const boardCols = boardData[boardKey];
     if (!boardCols || Object.keys(boardCols).length === 0) return '<p style="color:#666">Sin tareas.</p>';
+    // Sort columns by their position in the DB
+    const sortedNames = Object.keys(boardCols).sort((a, b) => {
+      const posA = colByName[a]?.position ?? 999;
+      const posB = colByName[b]?.position ?? 999;
+      return posA - posB;
+    });
     let html = '';
-    for (const [colName, colCards] of Object.entries(boardCols)) {
+    for (const colName of sortedNames) {
+      const colCards = boardCols[colName];
       html += `<div style="margin-bottom:16px"><p style="font-weight:bold;color:#244A80;margin:0 0 6px 0">${colName}</p><ul style="list-style:none;padding:0;margin:0">`;
       const sorted = [...colCards].sort((a, b) => (a.status === 'normal' ? 1 : -1));
       for (const card of sorted) {
