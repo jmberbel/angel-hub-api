@@ -184,6 +184,25 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (url.pathname === '/debug-tables') {
+    try {
+      const r = await supabaseGet('');
+      // Root returns OpenAPI spec — extract table names from definitions or paths
+      const spec = r.body;
+      const tables = spec && spec.definitions
+        ? Object.keys(spec.definitions)
+        : spec && spec.paths
+          ? Object.keys(spec.paths).map(p => p.replace(/^\//,''))
+          : spec;
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ tables }, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
   if (url.pathname === '/debug-supabase') {
     try {
       const [colRes, cardsRes] = await Promise.all([
