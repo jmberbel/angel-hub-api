@@ -176,6 +176,21 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  if (url.pathname === '/debug-supabase') {
+    try {
+      const [colRes, cardsRes] = await Promise.all([
+        supabaseGet('angel_encinar_board_columns?board=in.(weekly,weekly_ops)&order=board,position&limit=5'),
+        supabaseGet('angel_encinar_board_cards?board=in.(weekly,weekly_ops)&order=board,position&limit=5')
+      ]);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ columns: colRes.body, cards: cardsRes.body }, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
   if (req.method !== 'GET' || url.pathname !== '/send') {
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: false }));
