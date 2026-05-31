@@ -5,7 +5,10 @@ const dns = require('dns').promises;
 const os = require('os');
 const { execSync } = require('child_process');
 
+// SUPABASE_URL: use internal Traefik IP to avoid hairpin NAT (e.g. https://10.0.1.6)
+// SUPABASE_HOST: the public hostname for TLS SNI + Host header (supabase.operaciones.educaedtech.tools)
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://supabase.operaciones.educaedtech.tools';
+const SUPABASE_HOST = process.env.SUPABASE_HOST || null;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const RESEND_KEY = process.env.RESEND_KEY;
 const PORT = process.env.PORT || 3000;
@@ -28,14 +31,37 @@ function fetchJson(url, options = {}) {
 }
 
 function supabaseGet(path) {
-  const url = `${SUPABASE_URL}/rest/v1/${path}`;
-  return fetchJson(url, {
-    method: 'GET',
-    headers: {
-      'apikey': SUPABASE_KEY,
-      'Authorization': `Bearer ${SUPABASE_KEY}`
-    }
-  });
+  const fullUrl = `${SUPABASE_URL}/rest/v1/${path}`;
+  const headers = {
+    'apikey': SUPABASE_KEY,
+    'Authorization': `Bearer ${SUPABASE_KEY}`
+  };
+  // If using internal IP, override Host + SNI so Traefik routes correctly
+  if (SUPABASE_HOST) {
+    headers['Host'] = SUPABASE_HOST;
+    const urlObj = new URL(fullUrl);
+    return new Promise((resolve, reject) => {
+      const req = https.request({
+        hostname: urlObj.hostname,
+        port: urlObj.port || 443,
+        path: urlObj.pathname + urlObj.search,
+        method: 'GET',
+        headers,
+        servername: SUPABASE_HOST,
+        rejectUnauthorized: false
+      }, (res) => {
+        let data = '';
+        res.on('data', chunk => data += chunk);
+        res.on('end', () => {
+          try { resolve({ status: res.statusCode, body: JSON.parse(data) }); }
+          catch (e) { resolve({ status: res.statusCode, body: data }); }
+        });
+      });
+      req.on('error', reject);
+      req.end();
+    });
+  }
+  return fetchJson(fullUrl, { method: 'GET', headers });
 }
 
 function buildHtml(date, calendarEvents, columns, cards) {
