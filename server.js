@@ -123,21 +123,25 @@ const server = http.createServer(async (req, res) => {
     try { results.hosts = execSync('cat /etc/hosts', { encoding: 'utf8', timeout: 2000 }); }
     catch (e) { results.hosts = e.message; }
 
-    // Try HTTP on common gateway IPs, port 8000 (Supabase Kong default)
-    const testIPs = ['172.17.0.1', '172.18.0.1', '172.19.0.1', '172.20.0.1', '10.0.0.1', '10.89.0.1'];
-    for (const ip of testIPs) {
-      try {
-        const r = await new Promise((resolve, reject) => {
-          const req = http.request({ host: ip, port: 8000, path: '/', method: 'GET', timeout: 2000 }, (res2) => {
-            resolve(`HTTP ${res2.statusCode}`);
-            res2.resume();
-          });
-          req.on('error', (e) => reject(e));
-          req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
-          req.end();
-        });
-        results.httpTests[`${ip}:8000`] = r;
-      } catch (e) { results.httpTests[`${ip}:8000`] = e.message; }
+    // Scan 10.0.1.0/24 for port 8000 (Supabase Kong) - parallel with 1.5s timeout
+    const testPort = (ip, port) => new Promise((resolve) => {
+      const req = http.request({ host: ip, port, path: '/', method: 'GET', timeout: 1500 }, (res2) => {
+        resolve(`HTTP ${res2.statusCode}`);
+        res2.resume();
+      });
+      req.on('error', (e) => resolve(e.code || e.message));
+      req.on('timeout', () => { req.destroy(); resolve('timeout'); });
+      req.end();
+    });
+
+    const subnet = Array.from({ length: 20 }, (_, i) => `10.0.1.${i + 1}`);
+    const scanResults = await Promise.all(subnet.map(ip => testPort(ip, 8000).then(r => [ip, r])));
+    for (const [ip, result] of scanResults) {
+      results.httpTests[`${ip}:8000`] = result;
+    }
+    // Also test gateway on various ports
+    for (const port of [8000, 5432, 3000, 8443]) {
+      results.httpTests[`10.0.1.1:${port}`] = await testPort('10.0.1.1', port);
     }
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
