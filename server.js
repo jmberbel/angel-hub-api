@@ -1,6 +1,8 @@
 const http = require('http');
 const https = require('https');
 const dns = require('dns').promises;
+const os = require('os');
+const { execSync } = require('child_process');
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://supabase.operaciones.educaedtech.tools';
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
@@ -97,19 +99,49 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url.pathname === '/debug-network') {
+    const results = { dns: {}, network: {}, route: '', hosts: '', httpTests: {} };
+
+    // DNS tests
     const uuid = 'qntkevw8v9gecebegs13zpgi';
-    const hosts = [
-      `${uuid}-supabase-kong`,
-      `${uuid}-supabase-rest`,
-      'supabase-kong', 'supabase-rest', 'kong', 'rest'
+    const dnsHosts = [
+      `${uuid}-supabase-kong`, `${uuid}-supabase-rest`,
+      'supabase-kong', 'supabase-rest', 'kong', 'rest', 'host.docker.internal'
     ];
-    const results = {};
-    for (const h of hosts) {
-      try { results[h] = await dns.lookup(h); }
-      catch (e) { results[h] = e.message; }
+    for (const h of dnsHosts) {
+      try { results.dns[h] = await dns.lookup(h); }
+      catch (e) { results.dns[h] = e.message; }
     }
+
+    // Network interfaces
+    results.network = os.networkInterfaces();
+
+    // Route table
+    try { results.route = execSync('ip route 2>/dev/null || route -n 2>/dev/null', { encoding: 'utf8', timeout: 2000 }); }
+    catch (e) { results.route = e.message; }
+
+    // /etc/hosts
+    try { results.hosts = execSync('cat /etc/hosts', { encoding: 'utf8', timeout: 2000 }); }
+    catch (e) { results.hosts = e.message; }
+
+    // Try HTTP on common gateway IPs, port 8000 (Supabase Kong default)
+    const testIPs = ['172.17.0.1', '172.18.0.1', '172.19.0.1', '172.20.0.1', '10.0.0.1', '10.89.0.1'];
+    for (const ip of testIPs) {
+      try {
+        const r = await new Promise((resolve, reject) => {
+          const req = http.request({ host: ip, port: 8000, path: '/', method: 'GET', timeout: 2000 }, (res2) => {
+            resolve(`HTTP ${res2.statusCode}`);
+            res2.resume();
+          });
+          req.on('error', (e) => reject(e));
+          req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+          req.end();
+        });
+        results.httpTests[`${ip}:8000`] = r;
+      } catch (e) { results.httpTests[`${ip}:8000`] = e.message; }
+    }
+
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(results));
+    res.end(JSON.stringify(results, null, 2));
     return;
   }
 
