@@ -125,7 +125,7 @@ const server = http.createServer(async (req, res) => {
 
     const testPort = (ip, port, useTLS) => new Promise((resolve) => {
       const lib2 = useTLS ? https : http;
-      const opts = { host: ip, port, path: '/', method: 'GET', timeout: 1500, rejectUnauthorized: false };
+      const opts = { host: ip, port, path: '/', method: 'GET', timeout: 2000, rejectUnauthorized: false };
       const req = lib2.request(opts, (res2) => {
         resolve(`HTTP ${res2.statusCode}`);
         res2.resume();
@@ -135,12 +135,16 @@ const server = http.createServer(async (req, res) => {
       req.end();
     });
 
-    // Scan 10.0.1.1 - 10.0.1.50 for ports 80 and 443 (Traefik) in parallel
-    const ips = Array.from({ length: 50 }, (_, i) => `10.0.1.${i + 1}`);
-    const port80 = await Promise.all(ips.map(ip => testPort(ip, 80, false).then(r => [ip, r])));
-    const port443 = await Promise.all(ips.map(ip => testPort(ip, 443, true).then(r => [ip, r])));
-    for (const [ip, r] of port80) if (r !== 'ECONNREFUSED') results.httpTests[`${ip}:80`] = r;
-    for (const [ip, r] of port443) if (r !== 'ECONNREFUSED') results.httpTests[`${ip}:443`] = r;
+    // Test specific targets in parallel
+    const targets = [
+      ['10.0.1.1', 80, false], ['10.0.1.1', 443, true], ['10.0.1.1', 8080, false],
+      ['10.0.1.2', 80, false], ['10.0.1.2', 443, true],
+      ['10.0.1.3', 80, false], ['10.0.1.3', 443, true],
+      ['10.0.1.4', 80, false], ['10.0.1.4', 443, true],
+      ['10.0.1.5', 80, false], ['10.0.1.5', 443, true],
+    ];
+    const allTests = await Promise.all(targets.map(([ip, port, tls]) => testPort(ip, port, tls).then(r => [`${ip}:${port}`, r])));
+    for (const [key, r] of allTests) results.httpTests[key] = r;
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(results, null, 2));
