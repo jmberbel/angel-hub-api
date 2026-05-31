@@ -129,7 +129,7 @@ const server = http.createServer(async (req, res) => {
 
   if (url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, v: 'v6-tables' }));
+    res.end(JSON.stringify({ ok: true, v: 'v7-mcp' }));
     return;
   }
 
@@ -199,6 +199,210 @@ const server = http.createServer(async (req, res) => {
     } catch (err) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: err.message }));
+    }
+    return;
+  }
+
+  if (url.pathname === '/mcp') {
+    // Read full request body
+    const readBody = () => new Promise((resolve, reject) => {
+      let data = '';
+      req.on('data', chunk => data += chunk);
+      req.on('end', () => resolve(data));
+      req.on('error', reject);
+    });
+
+    const TOOLS = [
+      {
+        name: 'get_weekly_boards',
+        description: 'Get cards from weekly and weekly_ops boards, grouped by column/team.',
+        inputSchema: { type: 'object', properties: {}, required: [] }
+      },
+      {
+        name: 'get_roadmap',
+        description: 'Get tasks from angel_encinar_roadmap_tasks and teams from angel_encinar_roadmap_teams. Optional team filter.',
+        inputSchema: { type: 'object', properties: { team: { type: 'string', description: 'Optional team name filter' } }, required: [] }
+      },
+      {
+        name: 'get_notes',
+        description: 'Get all notes from angel_encinar_notes, with optional search term.',
+        inputSchema: { type: 'object', properties: { search: { type: 'string', description: 'Optional search term' } }, required: [] }
+      },
+      {
+        name: 'get_kpis',
+        description: 'Get data from angel_encinar_dashboard_kpi.',
+        inputSchema: { type: 'object', properties: {}, required: [] }
+      },
+      {
+        name: 'get_bookmarks',
+        description: 'Get bookmarks and folders from angel_encinar_fav_bookmarks and angel_encinar_fav_folders.',
+        inputSchema: { type: 'object', properties: {}, required: [] }
+      },
+      {
+        name: 'get_card_comments',
+        description: 'Get comments from angel_encinar_card_comments, with optional card_id filter.',
+        inputSchema: { type: 'object', properties: { card_id: { type: 'number', description: 'Optional card ID to filter comments' } }, required: [] }
+      }
+    ];
+
+    async function callTool(name, args) {
+      args = args || {};
+      if (name === 'get_weekly_boards') {
+        const [colRes, cardsRes] = await Promise.all([
+          supabaseGet('angel_encinar_board_columns?board=in.(weekly,weekly_ops)&order=board,position'),
+          supabaseGet('angel_encinar_board_cards?board=in.(weekly,weekly_ops)&order=board,status,position')
+        ]);
+        const columns = colRes.body || [];
+        const cards = cardsRes.body || [];
+        const colByName = {};
+        for (const col of columns) colByName[col.name] = col;
+        const boardData = { weekly: {}, weekly_ops: {} };
+        for (const card of cards) {
+          const board = card.board;
+          const colName = card.column_id || 'Sin columna';
+          if (!boardData[board]) boardData[board] = {};
+          if (!boardData[board][colName]) boardData[board][colName] = [];
+          boardData[board][colName].push(card);
+        }
+        // Sort columns by position for each board
+        const result = {};
+        for (const boardKey of Object.keys(boardData)) {
+          const sortedNames = Object.keys(boardData[boardKey]).sort((a, b) => {
+            const posA = colByName[a]?.position ?? 999;
+            const posB = colByName[b]?.position ?? 999;
+            return posA - posB;
+          });
+          result[boardKey] = {};
+          for (const name of sortedNames) result[boardKey][name] = boardData[boardKey][name];
+        }
+        return result;
+      }
+      if (name === 'get_roadmap') {
+        const [tasksRes, teamsRes] = await Promise.all([
+          supabaseGet('angel_encinar_roadmap_tasks?order=id'),
+          supabaseGet('angel_encinar_roadmap_teams?order=id')
+        ]);
+        let tasks = tasksRes.body || [];
+        if (args.team) {
+          const t = String(args.team).toLowerCase();
+          tasks = tasks.filter(x => {
+            const fields = [x.team, x.team_name, x.team_id].filter(Boolean).map(v => String(v).toLowerCase());
+            return fields.some(f => f.includes(t));
+          });
+        }
+        return { tasks, teams: teamsRes.body || [] };
+      }
+      if (name === 'get_notes') {
+        const r = await supabaseGet('angel_encinar_notes?order=id');
+        let notes = r.body || [];
+        if (args.search) {
+          const s = String(args.search).toLowerCase();
+          notes = notes.filter(n => JSON.stringify(n).toLowerCase().includes(s));
+        }
+        return notes;
+      }
+      if (name === 'get_kpis') {
+        const r = await supabaseGet('angel_encinar_dashboard_kpi?order=id');
+        return r.body || [];
+      }
+      if (name === 'get_bookmarks') {
+        const [bRes, fRes] = await Promise.all([
+          supabaseGet('angel_encinar_fav_bookmarks?order=id'),
+          supabaseGet('angel_encinar_fav_folders?order=id')
+        ]);
+        return { bookmarks: bRes.body || [], folders: fRes.body || [] };
+      }
+      if (name === 'get_card_comments') {
+        const path = args.card_id != null
+          ? `angel_encinar_card_comments?card_id=eq.${encodeURIComponent(args.card_id)}&order=id`
+          : 'angel_encinar_card_comments?order=id';
+        const r = await supabaseGet(path);
+        return r.body || [];
+      }
+      throw new Error(`Unknown tool: ${name}`);
+    }
+
+    async function handleMessage(msg) {
+      const isNotification = !('id' in msg);
+      const id = msg.id;
+      try {
+        let result;
+        switch (msg.method) {
+          case 'initialize':
+            result = {
+              protocolVersion: '2024-11-05',
+              capabilities: { tools: {} },
+              serverInfo: { name: 'angel-hub', version: '1.0.0' }
+            };
+            break;
+          case 'notifications/initialized':
+            return null;
+          case 'tools/list':
+            result = { tools: TOOLS };
+            break;
+          case 'tools/call': {
+            const params = msg.params || {};
+            const data = await callTool(params.name, params.arguments);
+            result = { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+            break;
+          }
+          case 'ping':
+            result = {};
+            break;
+          default:
+            if (isNotification) return null;
+            return { jsonrpc: '2.0', id, error: { code: -32601, message: `Method not found: ${msg.method}` } };
+        }
+        if (isNotification) return null;
+        return { jsonrpc: '2.0', id, result };
+      } catch (err) {
+        if (isNotification) return null;
+        return { jsonrpc: '2.0', id, error: { code: -32603, message: err.message } };
+      }
+    }
+
+    try {
+      if (req.method !== 'POST') {
+        res.writeHead(405, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Method not allowed' }));
+        return;
+      }
+      const raw = await readBody();
+      let payload;
+      try { payload = JSON.parse(raw); }
+      catch (e) {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } }));
+        return;
+      }
+
+      if (Array.isArray(payload)) {
+        const responses = [];
+        for (const msg of payload) {
+          const r = await handleMessage(msg);
+          if (r) responses.push(r);
+        }
+        if (responses.length === 0) {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(responses));
+        return;
+      }
+
+      const response = await handleMessage(payload);
+      if (!response) {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(response));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ jsonrpc: '2.0', id: null, error: { code: -32603, message: err.message } }));
     }
     return;
   }
