@@ -1,5 +1,6 @@
 const http = require('http');
 const https = require('https');
+const dns = require('dns').promises;
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://supabase.operaciones.educaedtech.tools';
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
@@ -89,9 +90,32 @@ ${buildBoard('weekly_ops')}
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost`);
 
+  if (url.pathname === '/health') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: true }));
+    return;
+  }
+
+  if (url.pathname === '/debug-network') {
+    const uuid = 'qntkevw8v9gecebegs13zpgi';
+    const hosts = [
+      `${uuid}-supabase-kong`,
+      `${uuid}-supabase-rest`,
+      'supabase-kong', 'supabase-rest', 'kong', 'rest'
+    ];
+    const results = {};
+    for (const h of hosts) {
+      try { results[h] = await dns.lookup(h); }
+      catch (e) { results[h] = e.message; }
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(results));
+    return;
+  }
+
   if (req.method !== 'GET' || url.pathname !== '/send') {
-    res.writeHead(url.pathname === '/health' ? 200 : 404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: url.pathname === '/health' }));
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false }));
     return;
   }
 
