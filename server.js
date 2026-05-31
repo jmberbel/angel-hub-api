@@ -123,9 +123,10 @@ const server = http.createServer(async (req, res) => {
     try { results.hosts = execSync('cat /etc/hosts', { encoding: 'utf8', timeout: 2000 }); }
     catch (e) { results.hosts = e.message; }
 
-    // Scan 10.0.1.0/24 for port 8000 (Supabase Kong) - parallel with 1.5s timeout
-    const testPort = (ip, port) => new Promise((resolve) => {
-      const req = http.request({ host: ip, port, path: '/', method: 'GET', timeout: 1500 }, (res2) => {
+    const testPort = (ip, port, useTLS) => new Promise((resolve) => {
+      const lib2 = useTLS ? https : http;
+      const opts = { host: ip, port, path: '/', method: 'GET', timeout: 1500, rejectUnauthorized: false };
+      const req = lib2.request(opts, (res2) => {
         resolve(`HTTP ${res2.statusCode}`);
         res2.resume();
       });
@@ -134,15 +135,12 @@ const server = http.createServer(async (req, res) => {
       req.end();
     });
 
-    const subnet = Array.from({ length: 20 }, (_, i) => `10.0.1.${i + 1}`);
-    const scanResults = await Promise.all(subnet.map(ip => testPort(ip, 8000).then(r => [ip, r])));
-    for (const [ip, result] of scanResults) {
-      results.httpTests[`${ip}:8000`] = result;
-    }
-    // Also test gateway on various ports
-    for (const port of [8000, 5432, 3000, 8443]) {
-      results.httpTests[`10.0.1.1:${port}`] = await testPort('10.0.1.1', port);
-    }
+    // Scan 10.0.1.1 - 10.0.1.50 for ports 80 and 443 (Traefik) in parallel
+    const ips = Array.from({ length: 50 }, (_, i) => `10.0.1.${i + 1}`);
+    const port80 = await Promise.all(ips.map(ip => testPort(ip, 80, false).then(r => [ip, r])));
+    const port443 = await Promise.all(ips.map(ip => testPort(ip, 443, true).then(r => [ip, r])));
+    for (const [ip, r] of port80) if (r !== 'ECONNREFUSED') results.httpTests[`${ip}:80`] = r;
+    for (const [ip, r] of port443) if (r !== 'ECONNREFUSED') results.httpTests[`${ip}:443`] = r;
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(results, null, 2));
