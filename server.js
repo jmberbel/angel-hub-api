@@ -1,5 +1,6 @@
 const http = require('http');
 const https = require('https');
+const net = require('net');
 const dns = require('dns').promises;
 const os = require('os');
 const { execSync } = require('child_process');
@@ -123,28 +124,26 @@ const server = http.createServer(async (req, res) => {
     try { results.hosts = execSync('cat /etc/hosts', { encoding: 'utf8', timeout: 2000 }); }
     catch (e) { results.hosts = e.message; }
 
-    const testPort = (ip, port, useTLS) => new Promise((resolve) => {
-      const lib2 = useTLS ? https : http;
-      const opts = { host: ip, port, path: '/', method: 'GET', timeout: 2000, rejectUnauthorized: false };
-      const req = lib2.request(opts, (res2) => {
-        resolve(`HTTP ${res2.statusCode}`);
-        res2.resume();
-      });
-      req.on('error', (e) => resolve(e.code || e.message));
-      req.on('timeout', () => { req.destroy(); resolve('timeout'); });
-      req.end();
+    // Use raw TCP socket — timeout fires even during SYN phase
+    const testTCP = (ip, port) => new Promise((resolve) => {
+      const sock = new net.Socket();
+      let done = false;
+      const finish = (r) => { if (!done) { done = true; sock.destroy(); resolve(r); } };
+      sock.setTimeout(1500);
+      sock.connect(port, ip, () => finish('OPEN'));
+      sock.on('timeout', () => finish('TIMEOUT'));
+      sock.on('error', (e) => finish(e.code || e.message));
     });
 
-    // Test specific targets in parallel
-    const targets = [
-      ['10.0.1.1', 80, false], ['10.0.1.1', 443, true], ['10.0.1.1', 8080, false],
-      ['10.0.1.2', 80, false], ['10.0.1.2', 443, true],
-      ['10.0.1.3', 80, false], ['10.0.1.3', 443, true],
-      ['10.0.1.4', 80, false], ['10.0.1.4', 443, true],
-      ['10.0.1.5', 80, false], ['10.0.1.5', 443, true],
-    ];
-    const allTests = await Promise.all(targets.map(([ip, port, tls]) => testPort(ip, port, tls).then(r => [`${ip}:${port}`, r])));
-    for (const [key, r] of allTests) results.httpTests[key] = r;
+    // Scan IPs 1-20 for ports 80 and 443 in parallel
+    const scan = [];
+    for (let i = 1; i <= 20; i++) {
+      const ip = `10.0.1.${i}`;
+      scan.push(testTCP(ip, 80).then(r => [`${ip}:80`, r]));
+      scan.push(testTCP(ip, 443).then(r => [`${ip}:443`, r]));
+    }
+    const scanRes = await Promise.all(scan);
+    for (const [key, r] of scanRes) if (r !== 'ECONNREFUSED') results.httpTests[key] = r;
 
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(results, null, 2));
