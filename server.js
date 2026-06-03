@@ -204,6 +204,17 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url.pathname === '/mcp') {
+    const ANGEL_HUB_TOKEN = process.env.ANGEL_HUB_TOKEN;
+    if (ANGEL_HUB_TOKEN) {
+      const authHeader = req.headers['authorization'] || '';
+      const incoming = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : (req.headers['x-api-key'] || '');
+      if (incoming !== ANGEL_HUB_TOKEN) {
+        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Unauthorized' }));
+        return;
+      }
+    }
+
     // Read full request body
     const readBody = () => new Promise((resolve, reject) => {
       let data = '';
