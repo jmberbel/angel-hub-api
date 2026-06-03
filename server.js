@@ -4,14 +4,44 @@ const net = require('net');
 const dns = require('dns').promises;
 const os = require('os');
 const { execSync } = require('child_process');
+const crypto = require('crypto');
 
-// SUPABASE_URL: use internal Traefik IP to avoid hairpin NAT (e.g. https://10.0.1.6)
-// SUPABASE_HOST: the public hostname for TLS SNI + Host header (supabase.operaciones.educaedtech.tools)
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://supabase.operaciones.educaedtech.tools';
 const SUPABASE_HOST = process.env.SUPABASE_HOST || null;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const RESEND_KEY = process.env.RESEND_KEY;
 const PORT = process.env.PORT || 3000;
+const ANGEL_HUB_TOKEN = process.env.ANGEL_HUB_TOKEN; // Bearer token for Claude Code CLI
+const ANGEL_PASSWORD = process.env.ANGEL_PASSWORD;   // Human password for OAuth login (Claude.ai web)
+const BASE_URL = process.env.BASE_URL || 'https://informe-angel.operaciones.educaedtech.tools';
+
+// OAuth state (in-memory)
+const authCodes = new Map();   // code -> { redirectUri, codeChallenge, expiresAt }
+const accessTokens = new Set();
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [code, data] of authCodes) {
+    if (data.expiresAt < now) authCodes.delete(code);
+  }
+}, 300_000);
+
+function b64url(buf) {
+  return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+}
+
+function parseBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = '';
+    req.on('data', chunk => data += chunk);
+    req.on('end', () => resolve(data));
+    req.on('error', reject);
+  });
+}
+
+function parseForm(body) {
+  return Object.fromEntries(new URLSearchParams(body));
+}
 
 function fetchJson(url, options = {}) {
   return new Promise((resolve, reject) => {
@@ -127,6 +157,145 @@ ${buildBoard('weekly_ops')}
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost`);
 
+  // OAuth discovery
+  if (url.pathname === '/.well-known/oauth-authorization-server') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      issuer: BASE_URL,
+      authorization_endpoint: `${BASE_URL}/authorize`,
+      token_endpoint: `${BASE_URL}/token`,
+      response_types_supported: ['code'],
+      grant_types_supported: ['authorization_code'],
+      code_challenge_methods_supported: ['S256']
+    }));
+    return;
+  }
+
+  // OAuth authorize — GET: show login form, POST: process login
+  if (url.pathname === '/authorize') {
+    if (req.method === 'GET') {
+      const state = url.searchParams.get('state') || '';
+      const redirectUri = url.searchParams.get('redirect_uri') || '';
+      const codeChallenge = url.searchParams.get('code_challenge') || '';
+      const clientId = url.searchParams.get('client_id') || '';
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+      res.end(`<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Angel Hub — Acceso</title>
+<style>
+  body{font-family:sans-serif;background:#f5f7fa;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+  .card{background:#fff;border-radius:12px;padding:40px 36px;box-shadow:0 2px 16px rgba(0,0,0,.08);width:100%;max-width:360px}
+  img{display:block;margin:0 auto 24px;height:36px}
+  h1{color:#244A80;font-size:18px;margin:0 0 8px}
+  p{color:#888;font-size:14px;margin:0 0 24px}
+  input{width:100%;box-sizing:border-box;padding:10px 14px;border:1px solid #ddd;border-radius:8px;font-size:15px;margin-bottom:16px}
+  button{width:100%;padding:11px;background:#244A80;color:#fff;border:none;border-radius:8px;font-size:15px;cursor:pointer}
+  button:hover{background:#1a3460}
+  .err{color:#c0392b;font-size:13px;margin-bottom:12px;display:none}
+</style></head><body>
+<div class="card">
+  <h1>Angel Hub</h1>
+  <p>Introduce tu contraseña de acceso para conectar con Claude.</p>
+  <form method="POST" action="/authorize">
+    <input type="hidden" name="state" value="${state}">
+    <input type="hidden" name="redirect_uri" value="${redirectUri}">
+    <input type="hidden" name="code_challenge" value="${codeChallenge}">
+    <input type="hidden" name="client_id" value="${clientId}">
+    <input type="password" name="password" placeholder="Contraseña" autofocus required>
+    <button type="submit">Conectar</button>
+  </form>
+</div></body></html>`);
+      return;
+    }
+
+    if (req.method === 'POST') {
+      const body = parseForm(await parseBody(req));
+      const { password, redirect_uri, code_challenge, state, client_id } = body;
+
+      if (!ANGEL_PASSWORD || password !== ANGEL_PASSWORD) {
+        res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(`<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Angel Hub — Acceso</title>
+<style>
+  body{font-family:sans-serif;background:#f5f7fa;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+  .card{background:#fff;border-radius:12px;padding:40px 36px;box-shadow:0 2px 16px rgba(0,0,0,.08);width:100%;max-width:360px}
+  h1{color:#244A80;font-size:18px;margin:0 0 8px}
+  p{color:#888;font-size:14px;margin:0 0 24px}
+  input{width:100%;box-sizing:border-box;padding:10px 14px;border:1px solid #ddd;border-radius:8px;font-size:15px;margin-bottom:16px}
+  button{width:100%;padding:11px;background:#244A80;color:#fff;border:none;border-radius:8px;font-size:15px;cursor:pointer}
+  .err{color:#c0392b;font-size:13px;margin-bottom:12px}
+</style></head><body>
+<div class="card">
+  <h1>Angel Hub</h1>
+  <p class="err">Contraseña incorrecta. Inténtalo de nuevo.</p>
+  <form method="POST" action="/authorize">
+    <input type="hidden" name="state" value="${state || ''}">
+    <input type="hidden" name="redirect_uri" value="${redirect_uri || ''}">
+    <input type="hidden" name="code_challenge" value="${code_challenge || ''}">
+    <input type="hidden" name="client_id" value="${client_id || ''}">
+    <input type="password" name="password" placeholder="Contraseña" autofocus required>
+    <button type="submit">Conectar</button>
+  </form>
+</div></body></html>`);
+        return;
+      }
+
+      const code = b64url(crypto.randomBytes(32));
+      authCodes.set(code, {
+        redirectUri: redirect_uri,
+        codeChallenge: code_challenge,
+        expiresAt: Date.now() + 600_000
+      });
+
+      const redirectUrl = new URL(redirect_uri);
+      redirectUrl.searchParams.set('code', code);
+      if (state) redirectUrl.searchParams.set('state', state);
+      res.writeHead(302, { Location: redirectUrl.toString() });
+      res.end();
+      return;
+    }
+  }
+
+  // OAuth token exchange
+  if (url.pathname === '/token' && req.method === 'POST') {
+    const body = parseForm(await parseBody(req));
+    const { code, redirect_uri, code_verifier, grant_type } = body;
+
+    if (grant_type !== 'authorization_code') {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'unsupported_grant_type' }));
+      return;
+    }
+
+    const stored = authCodes.get(code);
+    if (!stored || stored.expiresAt < Date.now()) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'invalid_grant' }));
+      return;
+    }
+
+    // Verify PKCE
+    const challenge = b64url(crypto.createHash('sha256').update(code_verifier).digest());
+    if (challenge !== stored.codeChallenge) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'invalid_grant' }));
+      return;
+    }
+
+    authCodes.delete(code);
+    const accessToken = b64url(crypto.randomBytes(48));
+    accessTokens.add(accessToken);
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      access_token: accessToken,
+      token_type: 'bearer',
+      expires_in: 86400
+    }));
+    return;
+  }
+
   if (url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: true, v: 'v7-mcp' }));
@@ -204,11 +373,11 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url.pathname === '/mcp') {
-    const ANGEL_HUB_TOKEN = process.env.ANGEL_HUB_TOKEN;
-    if (ANGEL_HUB_TOKEN) {
+    if (ANGEL_HUB_TOKEN || ANGEL_PASSWORD) {
       const authHeader = req.headers['authorization'] || '';
       const incoming = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : (req.headers['x-api-key'] || '');
-      if (incoming !== ANGEL_HUB_TOKEN) {
+      const valid = (ANGEL_HUB_TOKEN && incoming === ANGEL_HUB_TOKEN) || accessTokens.has(incoming);
+      if (!valid) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Unauthorized' }));
         return;
@@ -216,12 +385,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     // Read full request body
-    const readBody = () => new Promise((resolve, reject) => {
-      let data = '';
-      req.on('data', chunk => data += chunk);
-      req.on('end', () => resolve(data));
-      req.on('error', reject);
-    });
+    const readBody = () => parseBody(req);
 
     const TOOLS = [
       {
