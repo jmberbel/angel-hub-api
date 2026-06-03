@@ -347,7 +347,7 @@ const server = http.createServer(async (req, res) => {
 
   if (url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, v: 'v7-mcp' }));
+    res.end(JSON.stringify({ ok: true, v: 'v8-oauth' }));
     return;
   }
 
