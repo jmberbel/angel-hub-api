@@ -43,6 +43,10 @@ function parseForm(body) {
   return Object.fromEntries(new URLSearchParams(body));
 }
 
+function he(str) {
+  return String(str || '').replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 function fetchJson(url, options = {}) {
   return new Promise((resolve, reject) => {
     const lib = url.startsWith('https') ? https : http;
@@ -202,22 +206,20 @@ const server = http.createServer(async (req, res) => {
 <style>
   body{font-family:sans-serif;background:#f5f7fa;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
   .card{background:#fff;border-radius:12px;padding:40px 36px;box-shadow:0 2px 16px rgba(0,0,0,.08);width:100%;max-width:360px}
-  img{display:block;margin:0 auto 24px;height:36px}
   h1{color:#244A80;font-size:18px;margin:0 0 8px}
   p{color:#888;font-size:14px;margin:0 0 24px}
   input{width:100%;box-sizing:border-box;padding:10px 14px;border:1px solid #ddd;border-radius:8px;font-size:15px;margin-bottom:16px}
   button{width:100%;padding:11px;background:#244A80;color:#fff;border:none;border-radius:8px;font-size:15px;cursor:pointer}
   button:hover{background:#1a3460}
-  .err{color:#c0392b;font-size:13px;margin-bottom:12px;display:none}
 </style></head><body>
 <div class="card">
   <h1>Angel Hub</h1>
   <p>Introduce tu contraseña de acceso para conectar con Claude.</p>
   <form method="POST" action="/authorize">
-    <input type="hidden" name="state" value="${state}">
-    <input type="hidden" name="redirect_uri" value="${redirectUri}">
-    <input type="hidden" name="code_challenge" value="${codeChallenge}">
-    <input type="hidden" name="client_id" value="${clientId}">
+    <input type="hidden" name="state" value="${he(state)}">
+    <input type="hidden" name="redirect_uri" value="${he(redirectUri)}">
+    <input type="hidden" name="code_challenge" value="${he(codeChallenge)}">
+    <input type="hidden" name="client_id" value="${he(clientId)}">
     <input type="password" name="password" placeholder="Contraseña" autofocus required>
     <button type="submit">Conectar</button>
   </form>
@@ -247,10 +249,10 @@ const server = http.createServer(async (req, res) => {
   <h1>Angel Hub</h1>
   <p class="err">Contraseña incorrecta. Inténtalo de nuevo.</p>
   <form method="POST" action="/authorize">
-    <input type="hidden" name="state" value="${state || ''}">
-    <input type="hidden" name="redirect_uri" value="${redirect_uri || ''}">
-    <input type="hidden" name="code_challenge" value="${code_challenge || ''}">
-    <input type="hidden" name="client_id" value="${client_id || ''}">
+    <input type="hidden" name="state" value="${he(state)}">
+    <input type="hidden" name="redirect_uri" value="${he(redirect_uri)}">
+    <input type="hidden" name="code_challenge" value="${he(code_challenge)}">
+    <input type="hidden" name="client_id" value="${he(client_id)}">
     <input type="password" name="password" placeholder="Contraseña" autofocus required>
     <button type="submit">Conectar</button>
   </form>
@@ -276,7 +278,9 @@ const server = http.createServer(async (req, res) => {
 
   // OAuth token exchange
   if (url.pathname === '/token' && req.method === 'POST') {
-    const body = parseForm(await parseBody(req));
+    const rawBody = await parseBody(req);
+    const ct = req.headers['content-type'] || '';
+    const body = ct.includes('application/json') ? JSON.parse(rawBody || '{}') : parseForm(rawBody);
     const { code, redirect_uri, code_verifier, grant_type } = body;
 
     if (grant_type !== 'authorization_code') {
