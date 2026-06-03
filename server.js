@@ -164,9 +164,26 @@ const server = http.createServer(async (req, res) => {
       issuer: BASE_URL,
       authorization_endpoint: `${BASE_URL}/authorize`,
       token_endpoint: `${BASE_URL}/token`,
+      registration_endpoint: `${BASE_URL}/register`,
       response_types_supported: ['code'],
       grant_types_supported: ['authorization_code'],
       code_challenge_methods_supported: ['S256']
+    }));
+    return;
+  }
+
+  // Dynamic client registration (RFC 7591)
+  if (url.pathname === '/register' && req.method === 'POST') {
+    const body = JSON.parse(await parseBody(req) || '{}');
+    const clientId = b64url(crypto.randomBytes(16));
+    res.writeHead(201, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      client_id: clientId,
+      client_name: body.client_name || 'client',
+      redirect_uris: body.redirect_uris || [],
+      grant_types: ['authorization_code'],
+      response_types: ['code'],
+      token_endpoint_auth_method: 'none'
     }));
     return;
   }
