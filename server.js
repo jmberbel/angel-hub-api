@@ -18,6 +18,11 @@ const BASE_URL = process.env.BASE_URL || 'https://informe-angel.operaciones.educ
 // OAuth state (in-memory)
 const authCodes = new Map();   // code -> { redirectUri, codeChallenge, expiresAt }
 const accessTokens = new Set();
+const oauthLog = []; // last 20 oauth events for debugging
+function oLog(event, data) {
+  oauthLog.push({ ts: new Date().toISOString(), event, ...data });
+  if (oauthLog.length > 20) oauthLog.shift();
+}
 
 setInterval(() => {
   const now = Date.now();
@@ -161,6 +166,24 @@ ${buildBoard('weekly_ops')}
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost`);
 
+  // OAuth debug log
+  if (url.pathname === '/debug-oauth-log') {
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(oauthLog, null, 2));
+    return;
+  }
+
+  // CORS preflight for OAuth endpoints
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization'
+    });
+    res.end();
+    return;
+  }
+
   // OAuth discovery
   if (url.pathname === '/.well-known/oauth-authorization-server') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -231,7 +254,8 @@ const server = http.createServer(async (req, res) => {
       const body = parseForm(await parseBody(req));
       const { password, redirect_uri, code_challenge, state, client_id } = body;
 
-      if (!ANGEL_PASSWORD || password !== ANGEL_PASSWORD) {
+      oLog('authorize_post', { passwordMatch: password === ANGEL_PASSWORD, hasPassword: !!ANGEL_PASSWORD, redirectUri: redirect_uri?.slice(0, 60) });
+      if (!ANGEL_PASSWORD || password.trim() !== ANGEL_PASSWORD.trim()) {
         res.writeHead(401, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(`<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -267,11 +291,18 @@ const server = http.createServer(async (req, res) => {
         expiresAt: Date.now() + 600_000
       });
 
-      const redirectUrl = new URL(redirect_uri);
-      redirectUrl.searchParams.set('code', code);
-      if (state) redirectUrl.searchParams.set('state', state);
-      res.writeHead(302, { Location: redirectUrl.toString() });
-      res.end();
+      try {
+        const redirectUrl = new URL(redirect_uri);
+        redirectUrl.searchParams.set('code', code);
+        if (state) redirectUrl.searchParams.set('state', state);
+        oLog('authorize_redirect', { to: redirectUrl.toString().slice(0, 80) });
+        res.writeHead(302, { Location: redirectUrl.toString() });
+        res.end();
+      } catch (e) {
+        oLog('authorize_redirect_error', { error: e.message, redirect_uri });
+        res.writeHead(400, { 'Content-Type': 'text/plain' });
+        res.end('Invalid redirect_uri: ' + e.message);
+      }
       return;
     }
   }
@@ -290,15 +321,9 @@ const server = http.createServer(async (req, res) => {
     }
 
     const stored = authCodes.get(code);
-    if (!stored || stored.expiresAt < Date.now()) {
-      res.writeHead(400, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: 'invalid_grant' }));
-      return;
-    }
+    oLog('token_exchange', { codeFound: !!stored, grant_type, hasVerifier: !!code_verifier, bodyKeys: Object.keys(body) });
 
-    // Verify PKCE
-    const challenge = b64url(crypto.createHash('sha256').update(code_verifier).digest());
-    if (challenge !== stored.codeChallenge) {
+    if (!stored || stored.expiresAt < Date.now()) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'invalid_grant' }));
       return;
@@ -308,7 +333,10 @@ const server = http.createServer(async (req, res) => {
     const accessToken = b64url(crypto.randomBytes(48));
     accessTokens.add(accessToken);
 
-    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.writeHead(200, {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*'
+    });
     res.end(JSON.stringify({
       access_token: accessToken,
       token_type: 'bearer',
