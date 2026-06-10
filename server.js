@@ -184,6 +184,16 @@ const server = http.createServer(async (req, res) => {
     return;
   }
 
+  // OAuth protected resource metadata (RFC 9728) — Claude.ai uses this to discover the auth server
+  if (url.pathname === '/.well-known/oauth-protected-resource') {
+    res.writeHead(200, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' });
+    res.end(JSON.stringify({
+      resource: BASE_URL,
+      authorization_servers: [BASE_URL]
+    }));
+    return;
+  }
+
   // OAuth discovery
   if (url.pathname === '/.well-known/oauth-authorization-server') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -427,7 +437,10 @@ const server = http.createServer(async (req, res) => {
       const incoming = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : (req.headers['x-api-key'] || '');
       const valid = (ANGEL_HUB_TOKEN && incoming === ANGEL_HUB_TOKEN) || accessTokens.has(incoming);
       if (!valid) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
+        res.writeHead(401, {
+          'Content-Type': 'application/json',
+          'WWW-Authenticate': `Bearer realm="Angel Hub", resource_metadata="${BASE_URL}/.well-known/oauth-protected-resource"`
+        });
         res.end(JSON.stringify({ error: 'Unauthorized' }));
         return;
       }
