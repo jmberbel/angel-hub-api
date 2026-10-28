@@ -15,6 +15,15 @@ const ANGEL_HUB_TOKEN = process.env.ANGEL_HUB_TOKEN; // Bearer token for Claude 
 const ANGEL_PASSWORD = process.env.ANGEL_PASSWORD;   // Human password for OAuth login (Claude.ai web)
 const BASE_URL = process.env.BASE_URL || 'https://informe-angel.operaciones.educaedtech.tools';
 
+// MCP write scope. Values mirror the Angel Hub app (angel_hub.html); no tool can delete.
+const WRITABLE_BOARDS = ['weekly', 'weekly_ops', 'strategy', 'strategy_ops', 'strategy_dir'];
+const CARD_STATUSES = ['normal', 'yellow', 'pink', 'green'];
+const ROADMAPS = ['edtech', 'ops'];
+const ROADMAP_CATEGORIES = ['ALWAYS', 'OPERATIVOS', 'ESTRATÉGICOS'];
+const ROADMAP_STATUSES = ['pendiente', 'proceso', 'done'];
+const ROADMAP_SLOTS = 42;
+const NOTE_TAGS = ['Idea', 'Pendiente', 'Reunión', 'Tech', 'Estrategia', 'Personal'];
+
 // OAuth state (in-memory)
 const authCodes = new Map();   // code -> { redirectUri, codeChallenge, expiresAt }
 const accessTokens = new Set();
@@ -69,12 +78,18 @@ function fetchJson(url, options = {}) {
   });
 }
 
-function supabaseGet(path) {
+function supabaseRequest(method, path, payload) {
   const fullUrl = `${SUPABASE_URL}/rest/v1/${path}`;
   const headers = {
     'apikey': SUPABASE_KEY,
     'Authorization': `Bearer ${SUPABASE_KEY}`
   };
+  const body = payload !== undefined ? JSON.stringify(payload) : undefined;
+  if (body !== undefined) {
+    headers['Content-Type'] = 'application/json';
+    headers['Content-Length'] = Buffer.byteLength(body);
+    headers['Prefer'] = 'return=representation';
+  }
   // If using internal IP, override Host + SNI so Traefik routes correctly
   if (SUPABASE_HOST) {
     headers['Host'] = SUPABASE_HOST;
@@ -84,7 +99,7 @@ function supabaseGet(path) {
         hostname: urlObj.hostname,
         port: urlObj.port || 443,
         path: urlObj.pathname + urlObj.search,
-        method: 'GET',
+        method,
         headers,
         servername: SUPABASE_HOST,
         rejectUnauthorized: false
@@ -97,10 +112,33 @@ function supabaseGet(path) {
         });
       });
       req.on('error', reject);
+      if (body !== undefined) req.write(body);
       req.end();
     });
   }
-  return fetchJson(fullUrl, { method: 'GET', headers });
+  return fetchJson(fullUrl, { method, headers, body });
+}
+
+function supabaseGet(path) {
+  return supabaseRequest('GET', path);
+}
+
+// Writes fail loudly so the MCP client sees the Supabase error instead of empty data
+async function supabaseWrite(method, path, payload) {
+  const r = await supabaseRequest(method, path, payload);
+  if (r.status >= 300) {
+    const detail = typeof r.body === 'string' ? r.body : (r.body && (r.body.message || JSON.stringify(r.body)));
+    throw new Error(`Supabase ${method} ${path.split('?')[0]} failed (${r.status}): ${detail}`);
+  }
+  console.log(`[mcp-write] ${new Date().toISOString()} ${method} ${path}`);
+  return Array.isArray(r.body) ? r.body[0] : r.body;
+}
+
+function isAuthorized(req) {
+  if (!ANGEL_HUB_TOKEN && !ANGEL_PASSWORD) return true;
+  const authHeader = req.headers['authorization'] || '';
+  const incoming = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : (req.headers['x-api-key'] || '');
+  return Boolean((ANGEL_HUB_TOKEN && incoming === ANGEL_HUB_TOKEN) || accessTokens.has(incoming));
 }
 
 function buildHtml(date, calendarEvents, columns, cards) {
@@ -165,6 +203,13 @@ ${buildBoard('weekly_ops')}
 
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost`);
+
+  // Debug endpoints expose Supabase data and network info: same auth as /mcp
+  if (url.pathname.startsWith('/debug-') && !isAuthorized(req)) {
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Unauthorized' }));
+    return;
+  }
 
   // OAuth debug log
   if (url.pathname === '/debug-oauth-log') {
@@ -357,7 +402,7 @@ const server = http.createServer(async (req, res) => {
 
   if (url.pathname === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: true, v: 'v8-oauth' }));
+    res.end(JSON.stringify({ ok: true, v: 'v9-write' }));
     return;
   }
 
@@ -432,18 +477,13 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (url.pathname === '/mcp') {
-    if (ANGEL_HUB_TOKEN || ANGEL_PASSWORD) {
-      const authHeader = req.headers['authorization'] || '';
-      const incoming = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : (req.headers['x-api-key'] || '');
-      const valid = (ANGEL_HUB_TOKEN && incoming === ANGEL_HUB_TOKEN) || accessTokens.has(incoming);
-      if (!valid) {
-        res.writeHead(401, {
-          'Content-Type': 'application/json',
-          'WWW-Authenticate': `Bearer realm="Angel Hub", resource_metadata="${BASE_URL}/.well-known/oauth-protected-resource"`
-        });
-        res.end(JSON.stringify({ error: 'Unauthorized' }));
-        return;
-      }
+    if (!isAuthorized(req)) {
+      res.writeHead(401, {
+        'Content-Type': 'application/json',
+        'WWW-Authenticate': `Bearer realm="Angel Hub", resource_metadata="${BASE_URL}/.well-known/oauth-protected-resource"`
+      });
+      res.end(JSON.stringify({ error: 'Unauthorized' }));
+      return;
     }
 
     // Read full request body
@@ -479,40 +519,295 @@ const server = http.createServer(async (req, res) => {
         name: 'get_card_comments',
         description: 'Get comments from angel_encinar_card_comments, with optional card_id filter.',
         inputSchema: { type: 'object', properties: { card_id: { type: 'number', description: 'Optional card ID to filter comments' } }, required: [] }
+      },
+      {
+        name: 'get_strategy_boards',
+        description: 'Get cards from strategy, strategy_ops and strategy_dir boards, grouped by column.',
+        inputSchema: { type: 'object', properties: {}, required: [] }
+      },
+      {
+        name: 'create_card',
+        description: 'Create a card in a weekly or strategy board column. The column must already exist on that board (use get_weekly_boards / get_strategy_boards to see column names).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            board: { type: 'string', enum: WRITABLE_BOARDS },
+            column: { type: 'string', description: 'Exact column name on that board' },
+            text: { type: 'string', description: 'Card title' },
+            description: { type: 'string' },
+            status: { type: 'string', enum: CARD_STATUSES, description: 'normal (default), yellow, pink or green' },
+            start_date: { type: 'string', description: 'YYYY-MM-DD' },
+            end_date: { type: 'string', description: 'YYYY-MM-DD' }
+          },
+          required: ['board', 'column', 'text']
+        }
+      },
+      {
+        name: 'update_card',
+        description: 'Update fields of an existing weekly or strategy card. Only the fields provided are changed. Use move_card to change column.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            card_id: { type: 'number' },
+            text: { type: 'string' },
+            description: { type: 'string' },
+            status: { type: 'string', enum: CARD_STATUSES },
+            start_date: { type: 'string', description: 'YYYY-MM-DD' },
+            end_date: { type: 'string', description: 'YYYY-MM-DD' }
+          },
+          required: ['card_id']
+        }
+      },
+      {
+        name: 'move_card',
+        description: 'Move a weekly or strategy card to another column of the same board. Placed at the end of the column unless position is given.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            card_id: { type: 'number' },
+            column: { type: 'string', description: 'Exact target column name on the card board' },
+            position: { type: 'number' }
+          },
+          required: ['card_id', 'column']
+        }
+      },
+      {
+        name: 'create_roadmap_task',
+        description: 'Create a roadmap task. The timeline uses half-month slots: slot 1 = 1-15 Apr 2026, slot 2 = 16-30 Apr 2026, ... slot 42 = 16-31 Dec 2027. Team must exist in that roadmap (see get_roadmap).',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            roadmap: { type: 'string', enum: ROADMAPS, description: 'edtech (default) or ops' },
+            team: { type: 'string', description: 'Exact team name' },
+            category: { type: 'string', enum: ROADMAP_CATEGORIES },
+            name: { type: 'string' },
+            start_slot: { type: 'number', description: `1-${ROADMAP_SLOTS}` },
+            end_slot: { type: 'number', description: `start_slot-${ROADMAP_SLOTS}` },
+            status: { type: 'string', enum: ROADMAP_STATUSES, description: 'pendiente (default), proceso or done' },
+            description: { type: 'string' },
+            color: { type: 'string', description: 'Hex color. Defaults to the team color' }
+          },
+          required: ['team', 'category', 'name', 'start_slot', 'end_slot']
+        }
+      },
+      {
+        name: 'update_roadmap_task',
+        description: 'Update fields of an existing roadmap task. Only the fields provided are changed. Slots: 1 = 1-15 Apr 2026 ... 42 = 16-31 Dec 2027.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            task_id: { type: 'number' },
+            team: { type: 'string' },
+            category: { type: 'string', enum: ROADMAP_CATEGORIES },
+            name: { type: 'string' },
+            start_slot: { type: 'number' },
+            end_slot: { type: 'number' },
+            status: { type: 'string', enum: ROADMAP_STATUSES },
+            description: { type: 'string' },
+            color: { type: 'string' }
+          },
+          required: ['task_id']
+        }
+      },
+      {
+        name: 'create_note',
+        description: 'Create a note.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            title: { type: 'string' },
+            body: { type: 'string', description: 'Note content (HTML allowed, as in the app editor)' },
+            tag: { type: 'string', enum: NOTE_TAGS, description: 'Defaults to Idea' }
+          },
+          required: ['title']
+        }
+      },
+      {
+        name: 'update_note',
+        description: 'Update an existing note. Only the fields provided are changed.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            note_id: { type: 'number' },
+            title: { type: 'string' },
+            body: { type: 'string' },
+            tag: { type: 'string', enum: NOTE_TAGS }
+          },
+          required: ['note_id']
+        }
       }
     ];
+
+    async function getBoardsGrouped(boards) {
+      const list = boards.join(',');
+      const [colRes, cardsRes] = await Promise.all([
+        supabaseGet(`angel_encinar_board_columns?board=in.(${list})&order=board,position`),
+        supabaseGet(`angel_encinar_board_cards?board=in.(${list})&order=board,status,position`)
+      ]);
+      const columns = colRes.body || [];
+      const cards = cardsRes.body || [];
+      const colPos = {};
+      for (const col of columns) colPos[`${col.board}/${col.name}`] = col.position;
+      const boardData = {};
+      for (const b of boards) boardData[b] = {};
+      // Include empty columns so the client knows valid targets for create/move
+      for (const col of columns) if (boardData[col.board]) boardData[col.board][col.name] = [];
+      for (const card of cards) {
+        if (!boardData[card.board]) continue;
+        const colName = card.column_id || 'Sin columna';
+        if (!boardData[card.board][colName]) boardData[card.board][colName] = [];
+        boardData[card.board][colName].push(card);
+      }
+      const result = {};
+      for (const boardKey of boards) {
+        const sortedNames = Object.keys(boardData[boardKey]).sort((a, b) =>
+          (colPos[`${boardKey}/${a}`] ?? 999) - (colPos[`${boardKey}/${b}`] ?? 999));
+        result[boardKey] = {};
+        for (const name of sortedNames) result[boardKey][name] = boardData[boardKey][name];
+      }
+      return result;
+    }
+
+    function pick(args, fields) {
+      const out = {};
+      for (const f of fields) if (args[f] !== undefined) out[f] = args[f];
+      return out;
+    }
+
+    function assertEnum(value, allowed, field) {
+      if (value !== undefined && !allowed.includes(value)) {
+        throw new Error(`Invalid ${field} "${value}". Allowed: ${allowed.join(', ')}`);
+      }
+    }
+
+    function assertSlots(cs, ce) {
+      for (const v of [cs, ce]) {
+        if (!Number.isInteger(v) || v < 1 || v > ROADMAP_SLOTS) throw new Error(`Slots must be integers between 1 and ${ROADMAP_SLOTS}`);
+      }
+      if (cs > ce) throw new Error('start_slot must be <= end_slot');
+    }
+
+    async function getOne(table, id) {
+      const r = await supabaseGet(`${table}?id=eq.${encodeURIComponent(id)}`);
+      const row = Array.isArray(r.body) ? r.body[0] : null;
+      if (!row) throw new Error(`${table} id ${id} not found`);
+      return row;
+    }
+
+    async function assertColumn(board, column) {
+      const r = await supabaseGet(`angel_encinar_board_columns?board=eq.${encodeURIComponent(board)}&name=eq.${encodeURIComponent(column)}`);
+      if (!Array.isArray(r.body) || r.body.length === 0) throw new Error(`Column "${column}" does not exist on board ${board}`);
+    }
+
+    async function nextCardPosition(board, column) {
+      const r = await supabaseGet(`angel_encinar_board_cards?board=eq.${encodeURIComponent(board)}&column_id=eq.${encodeURIComponent(column)}&select=position&order=position.desc&limit=1`);
+      const top = Array.isArray(r.body) && r.body[0] ? r.body[0].position || 0 : -1;
+      return top + 1;
+    }
+
+    async function getTeam(roadmap, team) {
+      const r = await supabaseGet(`angel_encinar_roadmap_teams?roadmap=eq.${encodeURIComponent(roadmap)}&name=eq.${encodeURIComponent(team)}`);
+      const row = Array.isArray(r.body) ? r.body[0] : null;
+      if (!row) throw new Error(`Team "${team}" does not exist in roadmap ${roadmap}`);
+      return row;
+    }
+
+    async function getWritableCard(cardId) {
+      const card = await getOne('angel_encinar_board_cards', cardId);
+      if (!WRITABLE_BOARDS.includes(card.board)) throw new Error(`Card ${cardId} belongs to board ${card.board}, which is not writable`);
+      return card;
+    }
 
     async function callTool(name, args) {
       args = args || {};
       if (name === 'get_weekly_boards') {
-        const [colRes, cardsRes] = await Promise.all([
-          supabaseGet('angel_encinar_board_columns?board=in.(weekly,weekly_ops)&order=board,position'),
-          supabaseGet('angel_encinar_board_cards?board=in.(weekly,weekly_ops)&order=board,status,position')
-        ]);
-        const columns = colRes.body || [];
-        const cards = cardsRes.body || [];
-        const colByName = {};
-        for (const col of columns) colByName[col.name] = col;
-        const boardData = { weekly: {}, weekly_ops: {} };
-        for (const card of cards) {
-          const board = card.board;
-          const colName = card.column_id || 'Sin columna';
-          if (!boardData[board]) boardData[board] = {};
-          if (!boardData[board][colName]) boardData[board][colName] = [];
-          boardData[board][colName].push(card);
+        return getBoardsGrouped(['weekly', 'weekly_ops']);
+      }
+      if (name === 'get_strategy_boards') {
+        return getBoardsGrouped(['strategy', 'strategy_ops', 'strategy_dir']);
+      }
+      if (name === 'create_card') {
+        assertEnum(args.board, WRITABLE_BOARDS, 'board');
+        assertEnum(args.status, CARD_STATUSES, 'status');
+        if (!args.text) throw new Error('text is required');
+        await assertColumn(args.board, args.column);
+        const row = {
+          board: args.board,
+          column_id: args.column,
+          ...pick(args, ['text', 'description', 'status', 'start_date', 'end_date']),
+          position: await nextCardPosition(args.board, args.column)
+        };
+        return supabaseWrite('POST', 'angel_encinar_board_cards', row);
+      }
+      if (name === 'update_card') {
+        assertEnum(args.status, CARD_STATUSES, 'status');
+        await getWritableCard(args.card_id);
+        const changes = pick(args, ['text', 'description', 'status', 'start_date', 'end_date']);
+        if (Object.keys(changes).length === 0) throw new Error('No fields to update');
+        return supabaseWrite('PATCH', `angel_encinar_board_cards?id=eq.${encodeURIComponent(args.card_id)}`,
+          { ...changes, updated_at: new Date().toISOString() });
+      }
+      if (name === 'move_card') {
+        const card = await getWritableCard(args.card_id);
+        await assertColumn(card.board, args.column);
+        const position = Number.isInteger(args.position) ? args.position : await nextCardPosition(card.board, args.column);
+        return supabaseWrite('PATCH', `angel_encinar_board_cards?id=eq.${encodeURIComponent(args.card_id)}`,
+          { column_id: args.column, position, updated_at: new Date().toISOString() });
+      }
+      if (name === 'create_roadmap_task') {
+        const roadmap = args.roadmap || 'edtech';
+        assertEnum(roadmap, ROADMAPS, 'roadmap');
+        assertEnum(args.category, ROADMAP_CATEGORIES, 'category');
+        assertEnum(args.status, ROADMAP_STATUSES, 'status');
+        assertSlots(args.start_slot, args.end_slot);
+        if (!args.name) throw new Error('name is required');
+        const team = await getTeam(roadmap, args.team);
+        return supabaseWrite('POST', 'angel_encinar_roadmap_tasks', {
+          roadmap,
+          team_id: team.name,
+          cat_id: args.category,
+          name: args.name,
+          cs: args.start_slot,
+          ce: args.end_slot,
+          color: args.color || team.color,
+          status: args.status || 'pendiente',
+          description: args.description || ''
+        });
+      }
+      if (name === 'update_roadmap_task') {
+        assertEnum(args.category, ROADMAP_CATEGORIES, 'category');
+        assertEnum(args.status, ROADMAP_STATUSES, 'status');
+        const task = await getOne('angel_encinar_roadmap_tasks', args.task_id);
+        const changes = pick(args, ['name', 'status', 'description', 'color']);
+        if (args.team !== undefined) changes.team_id = (await getTeam(task.roadmap, args.team)).name;
+        if (args.category !== undefined) changes.cat_id = args.category;
+        if (args.start_slot !== undefined || args.end_slot !== undefined) {
+          const cs = args.start_slot ?? task.cs;
+          const ce = args.end_slot ?? task.ce;
+          assertSlots(cs, ce);
+          changes.cs = cs;
+          changes.ce = ce;
         }
-        // Sort columns by position for each board
-        const result = {};
-        for (const boardKey of Object.keys(boardData)) {
-          const sortedNames = Object.keys(boardData[boardKey]).sort((a, b) => {
-            const posA = colByName[a]?.position ?? 999;
-            const posB = colByName[b]?.position ?? 999;
-            return posA - posB;
-          });
-          result[boardKey] = {};
-          for (const name of sortedNames) result[boardKey][name] = boardData[boardKey][name];
-        }
-        return result;
+        if (Object.keys(changes).length === 0) throw new Error('No fields to update');
+        return supabaseWrite('PATCH', `angel_encinar_roadmap_tasks?id=eq.${encodeURIComponent(args.task_id)}`,
+          { ...changes, updated_at: new Date().toISOString() });
+      }
+      if (name === 'create_note') {
+        assertEnum(args.tag, NOTE_TAGS, 'tag');
+        if (!args.title) throw new Error('title is required');
+        return supabaseWrite('POST', 'angel_encinar_notes', {
+          title: args.title,
+          body: args.body || '',
+          tag: args.tag || 'Idea'
+        });
+      }
+      if (name === 'update_note') {
+        assertEnum(args.tag, NOTE_TAGS, 'tag');
+        await getOne('angel_encinar_notes', args.note_id);
+        const changes = pick(args, ['title', 'body', 'tag']);
+        if (Object.keys(changes).length === 0) throw new Error('No fields to update');
+        return supabaseWrite('PATCH', `angel_encinar_notes?id=eq.${encodeURIComponent(args.note_id)}`,
+          { ...changes, updated_at: new Date().toISOString() });
       }
       if (name === 'get_roadmap') {
         const [tasksRes, teamsRes] = await Promise.all([
@@ -569,7 +864,7 @@ const server = http.createServer(async (req, res) => {
             result = {
               protocolVersion: '2024-11-05',
               capabilities: { tools: {} },
-              serverInfo: { name: 'angel-hub', version: '1.0.0' }
+              serverInfo: { name: 'angel-hub', version: '1.1.0' }
             };
             break;
           case 'notifications/initialized':
